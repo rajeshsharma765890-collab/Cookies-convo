@@ -1,0 +1,30 @@
+{
+  "name": "facebook-message-bot",
+  "version": "1.0.0",
+  "description": "A Facebook messaging bot using fca-mafiya library",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "facebook",
+    "bot",
+    "messenger",
+    "automation",
+    "fca-mafiya"
+  ],
+  "author": "R4J M1SHR9",
+  "license": "MIT",
+  "dependencies": {
+    "fca-mafiya": "latest"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "your-repository-url-here"
+  }
+}
