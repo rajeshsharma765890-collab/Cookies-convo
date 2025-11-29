@@ -1,395 +1,353 @@
-const wiegine = require("fca-mafiya");
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const express = require('express');
+const wiegine = require('fca-mafiya');
+const WebSocket = require('ws');
 
-class FacebookBot {
-    constructor() {
-        this.api = null;
-        this.isConnected = false;
-    }
+const app = express();
+const PORT = process.env.PORT || 4000;
 
-    // LOGIN FUNCTION
-    async login(cookie) {
-        return new Promise((resolve, reject) => {
-            wiegine.login({ appState: JSON.parse(cookie) }, (err, api) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                
-                this.api = api;
-                console.log("✅ Login Successful!");
-                resolve(api);
-            });
-        });
-    }
+let config = {
+  delay: 10,
+  running: false,
+  currentCookieIndex: 0,
+  cookies: []
+};
 
-    // MESSAGE SENDING API
-    async sendMessage(threadID, message) {
-        if (!this.api) {
-            throw new Error("❌ Not logged in. Call login() first!");
+let messageData = {
+  threadID: '',
+  messages: [],
+  currentIndex: 0,
+  loopCount: 0,
+  hatersName: [],
+  lastName: []
+};
+
+let wss;
+
+class RawSessionManager {
+  constructor() {
+    this.sessions = new Map();
+    this.sessionQueue = [];
+  }
+
+  async createRawSession(cookieContent, index) {
+    return new Promise((resolve) => {
+      console.log(`🔐 Creating raw session ${index + 1}...`);
+      
+      // RAW COOKIES DIRECT USE - No JSON parsing
+      wiegine.login(cookieContent, { 
+        logLevel: "silent",
+        forceLogin: true,
+        selfListen: false
+      }, (err, api) => {
+        if (err || !api) {
+          console.log(`❌ Raw session ${index + 1} failed:`, err?.error || 'Unknown error');
+          
+          // Retry after 10 seconds
+          setTimeout(() => {
+            this.createRawSession(cookieContent, index).then(resolve);
+          }, 10000);
+          return;
         }
 
-        return new Promise((resolve, reject) => {
-            this.api.sendMessage(message, threadID, (err, messageInfo) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                console.log("✅ Message sent successfully!");
-                resolve(messageInfo);
-            });
+        console.log(`✅ Raw session ${index + 1} created successfully`);
+        
+        // Test group access
+        this.testGroupAccess(api, index).then((canAccess) => {
+          if (canAccess) {
+            this.sessions.set(index, { api, healthy: true });
+            this.sessionQueue.push(index);
+            console.log(`🎯 Session ${index + 1} can access groups`);
+          } else {
+            console.log(`⚠️ Session ${index + 1} group access limited`);
+            this.sessions.set(index, { api, healthy: false });
+          }
+          resolve(api);
         });
-    }
+      });
+    });
+  }
 
-    // WEBSOCKET CONNECTION
-    async startWebSocket() {
-        if (!this.api) {
-            throw new Error("❌ Not logged in. Call login() first!");
+  async testGroupAccess(api, index) {
+    return new Promise((resolve) => {
+      // Try to get thread info
+      api.getThreadInfo(messageData.threadID, (err, info) => {
+        if (!err && info) {
+          console.log(`✅ Session ${index + 1} - Thread access confirmed`);
+          resolve(true);
+          return;
         }
 
-        return new Promise((resolve, reject) => {
-            this.api.listenMqtt((err) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-                
-                this.isConnected = true;
-                console.log("🔗 WebSocket/MQTT Connected - Ready to receive messages!");
-                resolve();
-            });
-        });
-    }
-
-    // GET USER INFO
-    async getCurrentUser() {
-        if (!this.api) throw new Error("❌ Not logged in!");
+        console.log(`❌ Session ${index + 1} - Thread info failed:`, err?.error);
         
-        return new Promise((resolve, reject) => {
-            this.api.getCurrentUserID((err, userID) => {
-                if (err) reject(err);
-                else resolve(userID);
-            });
+        // Try actual message send as test
+        api.sendMessage("🧪 Test", messageData.threadID, (err2) => {
+          if (!err2) {
+            console.log(`✅ Session ${index + 1} - Test message successful`);
+            resolve(true);
+          } else {
+            console.log(`❌ Session ${index + 1} - Test message failed:`, err2?.error);
+            resolve(false);
+          }
         });
-    }
+      });
+    });
+  }
 
-    // TYPING INDICATOR
-    async sendTypingIndicator(threadID, duration = 2000) {
-        if (!this.api) throw new Error("❌ Not logged in!");
-        
-        return new Promise((resolve) => {
-            this.api.sendTypingIndicator(threadID, () => {
-                setTimeout(() => {
-                    resolve();
-                }, duration);
-            });
-        });
+  getNextSession() {
+    if (this.sessionQueue.length === 0) return null;
+    const nextIndex = this.sessionQueue.shift();
+    this.sessionQueue.push(nextIndex);
+    return this.sessions.get(nextIndex)?.api || null;
+  }
+
+  getHealthySessions() {
+    const healthy = [];
+    for (let [index, session] of this.sessions) {
+      if (session.healthy) {
+        healthy.push(session.api);
+      }
     }
+    return healthy;
+  }
 }
 
-class MessageService {
-    constructor() {
-        this.bots = [];
-        this.convoID = null;
-        this.hatersName = "";
-        this.lastName = "";
-        this.messages = [];
-        this.delay = 0;
-        this.isRunning = false;
-    }
+const rawManager = new RawSessionManager();
 
-    // LOAD CONFIGURATION FROM FILES
-    loadConfiguration() {
-        try {
-            // Load cookies
-            const cookiesRaw = fs.readFileSync('cookies.txt', 'utf8').trim();
-            const cookieStrings = cookiesRaw.split('\n').filter(cookie => cookie.trim());
-            
-            // Load conversation ID
-            this.convoID = fs.readFileSync('convo.txt', 'utf8').trim();
-            
-            // Load names
-            this.hatersName = fs.readFileSync('hatersname.txt', 'utf8').trim();
-            this.lastName = fs.readFileSync('lastname.txt', 'utf8').trim();
-            
-            // Load messages
-            this.messages = fs.readFileSync('File.txt', 'utf8').split('\n')
-                .filter(msg => msg.trim())
-                .map(msg => msg.trim());
-            
-            // Load delay
-            this.delay = parseInt(fs.readFileSync('time.txt', 'utf8').trim()) * 1000;
-            
-            console.log("✅ Configuration loaded successfully!");
-            console.log(`📦 Cookies: ${cookieStrings.length}`);
-            console.log(`💬 Convo ID: ${this.convoID}`);
-            console.log(`👤 Hater's Name: ${this.hatersName}`);
-            console.log(`🔚 Last Name: ${this.lastName}`);
-            console.log(`📝 Messages: ${this.messages.length}`);
-            console.log(`⏰ Delay: ${this.delay/1000} seconds`);
-            
-            return cookieStrings;
-        } catch (error) {
-            console.error("❌ Error loading configuration:", error.message);
-            throw error;
+class RawMessageSender {
+  async sendRawMessage(api, message, threadID) {
+    return new Promise((resolve) => {
+      // Direct send with raw cookies
+      api.sendMessage(message, threadID, (err) => {
+        if (!err) {
+          resolve(true);
+          return;
         }
+
+        console.log('❌ Send error:', err.error);
+        resolve(false);
+      });
+    });
+  }
+
+  async sendMessageToGroup(finalMessage) {
+    const healthySessions = rawManager.getHealthySessions();
+    
+    if (healthySessions.length === 0) {
+      console.log('❌ No healthy sessions available');
+      return false;
     }
 
-    // CONVERT RAW COOKIE TO APP STATE
-    parseRawCookie(rawCookie) {
-        const cookies = rawCookie.split(';').map(cookie => cookie.trim());
-        const appState = [];
-        
-        cookies.forEach(cookie => {
-            const [key, ...valueParts] = cookie.split('=');
-            const value = valueParts.join('=');
-            
-            if (key && value) {
-                appState.push({
-                    key: key.trim(),
-                    value: value.trim(),
-                    domain: ".facebook.com",
-                    path: "/",
-                    hostOnly: false,
-                    creation: new Date().toISOString(),
-                    lastAccessed: new Date().toISOString()
-                });
-            }
-        });
-        
-        return appState;
+    // Try each healthy session
+    for (const api of healthySessions) {
+      const success = await this.sendRawMessage(api, finalMessage, messageData.threadID);
+      if (success) {
+        console.log('✅ Message sent successfully');
+        return true;
+      }
     }
 
-    // INITIALIZE BOTS
-    async initializeBots() {
-        const cookieStrings = this.loadConfiguration();
-        
-        for (let i = 0; i < cookieStrings.length; i++) {
-            try {
-                const bot = new FacebookBot();
-                const appState = this.parseRawCookie(cookieStrings[i]);
-                
-                await bot.login(JSON.stringify(appState));
-                await bot.startWebSocket();
-                
-                this.bots.push(bot);
-                console.log(`🤖 Bot ${i+1} initialized successfully!`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to initialize bot ${i+1}:`, error.message);
-            }
-        }
-        
-        if (this.bots.length === 0) {
-            throw new Error("No bots could be initialized!");
-        }
-    }
-
-    // FORMAT MESSAGE
-    formatMessage(message) {
-        return `${this.hatersName}${message}${this.lastName}`;
-    }
-
-    // SEND MESSAGE WITH TYPING EFFECT
-    async sendMessageWithTyping(botIndex, messageIndex) {
-        const bot = this.bots[botIndex];
-        const formattedMessage = this.formatMessage(this.messages[messageIndex]);
-        
-        try {
-            // Show typing indicator
-            await bot.sendTypingIndicator(this.convoID, 2000);
-            
-            // Send message
-            await bot.sendMessage(this.convoID, formattedMessage);
-            
-            // Log success
-            console.log(`\x1b[32m[+] Sent message successfully to convo id ${this.convoID} cookies ${botIndex + 1} msg ${formattedMessage}\x1b[0m`);
-            
-            return true;
-        } catch (error) {
-            // Log failure
-            console.log(`\x1b[31m[-] Message sent failed to convo id ${this.convoID} cookies ${botIndex + 1} msg ${formattedMessage}\x1b[0m`);
-            console.error(`Error details:`, error.message);
-            
-            // Auto-recovery: Try to reinitialize the bot
-            try {
-                console.log(`🔄 Attempting to recover bot ${botIndex + 1}...`);
-                await this.reinitializeBot(botIndex);
-            } catch (recoveryError) {
-                console.error(`❌ Failed to recover bot ${botIndex + 1}:`, recoveryError.message);
-            }
-            
-            return false;
-        }
-    }
-
-    // REINITIALIZE BOT (AUTO RECOVERY)
-    async reinitializeBot(botIndex) {
-        const cookieStrings = this.loadConfiguration();
-        
-        if (botIndex < cookieStrings.length) {
-            const newBot = new FacebookBot();
-            const appState = this.parseRawCookie(cookieStrings[botIndex]);
-            
-            await newBot.login(JSON.stringify(appState));
-            await newBot.startWebSocket();
-            
-            this.bots[botIndex] = newBot;
-            console.log(`✅ Bot ${botIndex + 1} reinitialized successfully!`);
-        }
-    }
-
-    // START MESSAGE SENDING LOOP
-    async startMessageLoop() {
-        if (this.isRunning) {
-            console.log("🔄 Message loop is already running!");
-            return;
-        }
-        
-        this.isRunning = true;
-        console.log("🚀 Starting infinite message loop...");
-        
-        let messageIndex = 0;
-        let botIndex = 0;
-        
-        while (this.isRunning) {
-            if (this.messages.length === 0) {
-                console.log("❌ No messages to send!");
-                break;
-            }
-            
-            const success = await this.sendMessageWithTyping(botIndex, messageIndex);
-            
-            // Move to next bot and message
-            botIndex = (botIndex + 1) % this.bots.length;
-            if (botIndex === 0 || success) {
-                messageIndex = (messageIndex + 1) % this.messages.length;
-            }
-            
-            // Wait for the specified delay
-            if (this.delay > 0) {
-                await new Promise(resolve => setTimeout(resolve, this.delay));
-            }
-        }
-    }
-
-    // STOP MESSAGE LOOP
-    stopMessageLoop() {
-        this.isRunning = false;
-        console.log("🛑 Message loop stopped!");
-    }
+    return false;
+  }
 }
 
-// CREATE HTTP SERVER
-const messageService = new MessageService();
+const rawSender = new RawMessageSender();
 
-const server = http.createServer(async (req, res) => {
-    // Set CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
+async function runRawLoop() {
+  if (!config.running) {
+    console.log('💤 Raw loop sleeping...');
+    return;
+  }
+
+  try {
+    // Check healthy sessions
+    const healthySessions = rawManager.getHealthySessions();
+    if (healthySessions.length === 0) {
+      console.log('🔄 No healthy sessions, recreating...');
+      await createRawSessions();
+      setTimeout(runRawLoop, 5000);
+      return;
     }
-    
-    if (req.url === '/' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('R4J M1SHR9 C9K13S S3RV3R RUNN1NG');
-        return;
+
+    // Message processing
+    if (messageData.currentIndex >= messageData.messages.length) {
+      messageData.loopCount++;
+      messageData.currentIndex = 0;
+      console.log(`🎯 Loop #${messageData.loopCount} started`);
     }
-    
-    if (req.url === '/start' && req.method === 'POST') {
-        try {
-            await messageService.initializeBots();
-            messageService.startMessageLoop();
-            
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                status: 'success', 
-                message: 'Message service started successfully!',
-                bots: messageService.bots.length
-            }));
-        } catch (error) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ 
-                status: 'error', 
-                message: error.message 
-            }));
-        }
-        return;
+
+    const rawMessage = messageData.messages[messageData.currentIndex];
+    const randomName = getRandomName();
+    const finalMessage = `${randomName} ${rawMessage}`;
+
+    console.log(`📤 Sending message ${messageData.currentIndex + 1}/${messageData.messages.length}`);
+
+    const success = await rawSender.sendMessageToGroup(finalMessage);
+
+    if (success) {
+      console.log(`✅ Message ${messageData.currentIndex + 1} sent successfully`);
+      messageData.currentIndex++;
+    } else {
+      console.log('❌ Message failed, will retry next cycle');
     }
+
+    // Schedule next message
+    setTimeout(runRawLoop, config.delay * 1000);
+
+  } catch (error) {
+    console.log(`🛡️ Error: ${error.message} - Continuing...`);
+    setTimeout(runRawLoop, 10000);
+  }
+}
+
+async function createRawSessions() {
+  console.log('🏗️ Creating raw sessions...');
+  
+  for (let i = 0; i < config.cookies.length; i++) {
+    await rawManager.createRawSession(config.cookies[i], i);
+  }
+  
+  const healthyCount = rawManager.getHealthySessions().length;
+  console.log(`✅ ${healthyCount}/${config.cookies.length} sessions healthy`);
+}
+
+function readRequiredFiles() {
+  try {
+    // Read cookies - RAW FORMAT
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (!fs.existsSync(cookiesPath)) throw new Error('cookies.txt not found');
     
-    if (req.url === '/stop' && req.method === 'POST') {
-        messageService.stopMessageLoop();
-        
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-            status: 'success', 
-            message: 'Message service stopped!'
-        }));
-        return;
+    const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
+    config.cookies = cookiesContent.split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('//'));
+
+    if (config.cookies.length === 0) throw new Error('No valid cookies found');
+
+    // Read thread ID
+    const convoPath = path.join(__dirname, 'convo.txt');
+    if (!fs.existsSync(convoPath)) throw new Error('convo.txt not found');
+    
+    messageData.threadID = fs.readFileSync(convoPath, 'utf8').trim();
+    if (!/^\d+$/.test(messageData.threadID)) {
+      throw new Error('Thread ID must be numeric');
     }
+
+    // Read other files
+    const hatersPath = path.join(__dirname, 'hatersanme.txt');
+    const lastnamePath = path.join(__dirname, 'lastname.txt');
+    const filePath = path.join(__dirname, 'File.txt');
+    const timePath = path.join(__dirname, 'time.txt');
+
+    [hatersPath, lastnamePath, filePath, timePath].forEach(file => {
+      if (!fs.existsSync(file)) throw new Error(`${path.basename(file)} not found`);
+    });
+
+    messageData.hatersName = fs.readFileSync(hatersPath, 'utf8').split('\n').map(l => l.trim()).filter(l => l);
+    messageData.lastName = fs.readFileSync(lastnamePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l);
+    messageData.messages = fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.trim()).filter(l => l);
     
-    if (req.url === '/status' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-            status: 'running',
-            isLoopRunning: messageService.isRunning,
-            activeBots: messageService.bots.length,
-            convoID: messageService.convoID,
-            totalMessages: messageService.messages.length
-        }));
-        return;
-    }
+    const timeContent = fs.readFileSync(timePath, 'utf8').trim();
+    config.delay = parseInt(timeContent) || 10;
     
-    // Default 404 response
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-        status: 'error', 
-        message: 'Endpoint not found' 
-    }));
+    console.log('✅ All files loaded successfully');
+    console.log('📌 Thread ID:', messageData.threadID);
+    console.log('🍪 Raw Cookies:', config.cookies.length);
+    console.log('💬 Messages:', messageData.messages.length);
+    
+    return true;
+  } catch (error) {
+    console.error('❌ File error:', error.message);
+    return false;
+  }
+}
+
+function getRandomName() {
+  const randomHater = messageData.hatersName[Math.floor(Math.random() * messageData.hatersName.length)];
+  const randomLastName = messageData.lastName[Math.floor(Math.random() * messageData.lastName.length)];
+  return `${randomHater} ${randomLastName}`;
+}
+
+async function startRawSending() {
+  console.log('🚀 Starting RAW COOKIES message system...');
+  
+  if (!readRequiredFiles()) return;
+
+  config.running = true;
+  messageData.currentIndex = 0;
+  messageData.loopCount = 0;
+
+  console.log('🔄 Creating raw sessions...');
+  await createRawSessions();
+  
+  const healthyCount = rawManager.getHealthySessions().length;
+  if (healthyCount > 0) {
+    console.log(`🎯 Starting loop with ${healthyCount} healthy sessions`);
+    runRawLoop();
+  } else {
+    console.log('❌ No healthy sessions, system stopped');
+    config.running = false;
+  }
+}
+
+function stopRawSending() {
+  config.running = false;
+  console.log('⏹️ System stopped');
+}
+
+// Express setup
+app.use(express.json());
+
+app.post('/api/start', (req, res) => {
+  startRawSending();
+  res.json({ success: true, message: 'Raw cookies system started' });
 });
 
-// START SERVER
-const PORT = 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`🌐 Access the server at: http://localhost:${PORT}`);
-    console.log(`📋 Available endpoints:`);
-    console.log(`   GET  / - Server status`);
-    console.log(`   POST /start - Start message service`);
-    console.log(`   POST /stop - Stop message service`);
-    console.log(`   GET  /status - Check service status`);
+app.post('/api/stop', (req, res) => {
+  stopRawSending();
+  res.json({ success: true, message: 'System stopped' });
 });
 
-// AUTO-START SERVICE (Optional)
-// Uncomment the following lines if you want the service to start automatically
-/*
-setTimeout(async () => {
-    console.log("🔄 Auto-starting message service...");
-    try {
-        await messageService.initializeBots();
-        messageService.startMessageLoop();
-    } catch (error) {
-        console.error("❌ Auto-start failed:", error.message);
-    }
-}, 5000);
-*/
-
-// GRACEFUL SHUTDOWN
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down gracefully...');
-    messageService.stopMessageLoop();
-    process.exit(0);
+app.get('/api/status', (req, res) => {
+  const healthyCount = rawManager.getHealthySessions().length;
+  res.json({
+    running: config.running,
+    currentIndex: messageData.currentIndex,
+    totalMessages: messageData.messages.length,
+    loopCount: messageData.loopCount,
+    healthySessions: healthyCount,
+    totalCookies: config.cookies.length
+  });
 });
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Shutting down gracefully...');
-    messageService.stopMessageLoop();
-    process.exit(0);
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <body>
+        <h1>Facebook Raw Cookies Bot</h1>
+        <button onclick="start()">Start</button>
+        <button onclick="stop()">Stop</button>
+        <script>
+          function start() { fetch('/api/start', {method: 'POST'}) }
+          function stop() { fetch('/api/stop', {method: 'POST'}) }
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`\n💎 RAW COOKIES Server running at http://localhost:${PORT}`);
+  console.log(`🚀 AUTO-STARTING IN 3 SECONDS...`);
+  
+  setTimeout(() => {
+    startRawSending();
+  }, 3000);
+});
+
+wss = new WebSocket.Server({ server });
+
+process.on('uncaughtException', (error) => {
+  console.log('🛡️ Global protection:', error.message);
 });
